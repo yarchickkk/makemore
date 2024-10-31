@@ -3,52 +3,50 @@ import torch.nn as nn
 from torch.nn import functional as F
 from dataclasses import dataclass
 import tiktoken
+import time
 
 
 
 
 @dataclass
 class GPTConfig:
-    block_size: int = 256 
-    vocab_size: int = 65
-    n_layer: int = 6
-    n_head: int = 6
-    n_embd: int = 384
-    n_examples: int = 32
+    block_size: int = 1024  # max sequence length 
+    vocab_size: int = 50257  # number of tokens, 50k BPE merges + 256 byte tokens + 1 end token
+    n_layer: int = 12  # number of layers 
+    n_head: int = 12  # number of heads
+    n_embd: int = 768  # embedding dimension
 
 
-class DataLoader():
+class DataLoaderLite():
     """
     Class for loading, encoding and decoding text data using gpt2 tokinizer. Samples batches sequentially
     by slicing tokens, starting at the first one and moving back to it as it reaches the last one.
     """
 
-    def __init__(self, config: GPTConfig) -> None:
-        self.bs = config.block_size
-        self.n = config.n_examples
-        self.ptr = 0  # initialize pointer
-        self.tokenizer = tiktoken.get_encoding('gpt2')
+    def __init__(self, B, T) -> None:
+        self.B, self.T = B, T
+        # state
+        self.current_position = 0  
         
         # read the data, tokenize it and save as tensor
         with open('input.txt', 'r', encoding='utf-8') as file:
             text = file.read()
-        self.text = torch.tensor(self.tokenizer.encode(text))
-        self.text_length = self.text.shape[0]
+        enc = tiktoken.get_encoding('gpt2')
+        tokens = enc.encode(text)
+        self.tokens = torch.tensor(tokens)
 
     def next_batch(self) -> torch.Tensor:
-        # check wether there's enough elements left for a new batch
-        if self.ptr + self.bs * self.n < self.text_length:
-            pass
-        else:
-            self.ptr = 0  # if not, go to the first token
-        
-        end = self.ptr + self.bs * self.n  # end of the batch
-        X = self.text[self.ptr:end]  # inputs
-        Y = self.text[self.ptr + 1:end + 1]  # targets, shifted by 1 to get next characters
-        
-        self.ptr += 1
-        return tuple(s.view(self.n, self.bs) for s in (X, Y))  # 1D -> 2D
-
+        B, T = self.B, self.T
+        buff = self.tokens[self.current_position:self.current_position + B * T + 1]
+        x = buff[:-1].view(B, T)
+        y = buff[1:].view(B, T)
+        # update pointer state
+        self.current_position += B * T
+        # if loading next batch would be out of bounds, reset
+        if self.current_position + (B * T + 1) > len(self.tokens):
+            self.current_position = 0
+        return x, y
+    """
     def decode(self, x: torch.Tensor) -> None:
         assert x.dim() == 2, f"Expected 2-D tensor, but recieved {x.dim()}-D one."
         list_x = x.tolist()
@@ -56,65 +54,66 @@ class DataLoader():
             decoding = self.tokenizer.decode(row)
             print(f"<{i}>\n{decoding}")
         print("<end>")
+    """
 
-class MultiHeadSelfAttention(nn.Module):
+
+class CasualSelfAttention(nn.Module):
     """
     Class for Multi-Head Self-Attention, nothing too crazy.
     """
 
-    def __init__(self, config: GPTConfig) -> None:  # COMPARE!
+    def __init__(self, config: GPTConfig) -> None:
         super().__init__()
-        self.config = config
 
-        assert self.config.n_embd % self.config.n_head == 0, "Unable to evenly split the embedding vector across all heads."
-        self.head_size = self.config.n_embd // self.config.n_head
+        assert config.n_embd % config.n_head == 0, "Unable to evenly split the embedding vector across all heads."
+        self.head_size = config.n_embd // config.n_head
+        self.n_head = config.n_head
+        self.n_embd = config.n_embd
 
         # [[query, key, value], ...] merged in a singe dimension
-        self.qkv = nn.Linear(self.config.n_embd, 3 * self.head_size)
+        self.c_attn = nn.Linear(config.n_embd, 3 * self.n_embd)
         # projection layer applied before residual connection
-        self.proj = nn.Linear(self.config.n_embd, self.config.n_embd)
+        self.c_proj = nn.Linear(config.n_embd, config.n_embd)
+        self.c_proj.NANOGPT_SCALE_INIT = 1
         # untrained masking tensor, stored as a evvicent torch buffer
-        self.register_buffer('tril', torch.tril(torch.ones(self.config.block_size, self.config.block_size)))
+        self.register_buffer('bias', torch.tril(torch.ones(config.block_size, config.block_size))
+                             .view(1, 1, config.block_size, config.block_size))  # reshape manually, explicity!
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         B, T, C = x.shape  # C = n_embd
-        H = self.config.n_head
-
-        # add head dimension
-        x = torch.unsqueeze(x, 1).repeat(1, H, 1, 1)  # (B, H, T, C), C = n_embd
-        # turn each embedding to [q, k, v]
-        merged_qkv = self.qkv(x)
-        # split on separate q, k, v tensors
-        q, k, v = merged_qkv.split(self.head_size, dim=3)  # (B, H, T, C), C = head_size
-
-        # get weights multiplying querys and keys and mask them
-        wei = q @ k.transpose(2, 3)  # (B, H, T, T)
-        wei = torch.masked_fill(wei[:, :, :T, :T], self.tril[:T, :T] == 0, float('-inf'))  # slice to sample safely
-        wei = torch.exp(wei)
-        # obtain weighted aggregation of values
-        x = wei @ v  # (B, H, T, C), C = head_size
-
-        # some tricky matrix manipulation to merge heads in embedding
-        x = x.permute(0, 2, 1, 3).reshape(B, T, H * self.head_size)  # (B, T, n_heads * head_size | n_embd)
-        x = self.proj(x)  # pre-residual projection
-        return x
+        qkv = self.c_attn(x)  # (B, T, C), C = 3 * n_embd
+        q, k, v = torch.split(qkv, self.n_embd, dim=2)  # (B, T, C), C = n_embd
+        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
+        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
+        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2)  # (B, nh, T, hs)
+        # attention (materializes the large (T,T) matrix for all the queries and keys)
+        """
+        att = q @ k.transpose(-2, -1) * (k.size(-1)**-0.5)
+        att = att.masked_fill(self.bias[:, :, :T, :T] == 0, float("-inf"))  # slice for sequences shorter than block size
+        att = F.softmax(att, dim=-1)
+        y = att @ v
+        """
+        y = F.scaled_dot_product_attention(q, k, v, is_causal=True)
+        y = y.transpose(1, 2).contiguous().view(B, T, C)  # re-assemble all head outputs side by side
+        # output projection
+        y = self.c_proj(y)
+        return y
 
 
 class MLP(nn.Module):
 
     def __init__(self, config: GPTConfig) -> None:
         super().__init__()
-        self.config = config
-
-        self.fc = nn.Linear(self.config.n_embd, self.config.n_embd)  # fc - fully connected
+        self.c_fc = nn.Linear(config.n_embd, 4 * config.n_embd)  # fc - fully connected
         self.gelu = nn.GELU(approximate="tanh")  # same non-linearity was used in gpt2 training
-        # projection layer applied before residual connection
-        self.proj = nn.Linear(self.config.n_embd, self.config.n_embd)
+        self.c_proj = nn.Linear(4 * config.n_embd, config.n_embd)  # project before residual connection
+        self.c_proj.NANOGPT_SCALE_INIT = 1
+
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        x = self.fc(x)
+        x = self.c_fc(x)
         x = self.gelu(x)
-        x = self.proj(x)
+        x = self.c_proj(x)
         return x
 
 
@@ -122,12 +121,10 @@ class Block(nn.Module):
     
     def __init__(self, config: GPTConfig) -> None:
         super().__init__()
-        self.config = config
-
-        self.ln_1 = nn.LayerNorm(self.config.n_embd, self.config.n_embd)
-        self.attn = MultiHeadSelfAttention(self.config)
-        self.ln_2 = nn.LayerNorm(self.config.n_embd, self.config.n_embd)
-        self.mlp = MLP(self.config)  # COMPARE!
+        self.ln_1 = nn.LayerNorm(config.n_embd)
+        self.attn = CasualSelfAttention(config)
+        self.ln_2 = nn.LayerNorm(config.n_embd)
+        self.mlp = MLP(config)
 
     def forward(self, x: torch.Tensor):
         # normalization -> action -> residual connection
@@ -141,33 +138,52 @@ class GPT(nn.Module):
     def __init__(self, config: GPTConfig) -> None:
         super().__init__()
         self.config = config
+        self.transformer = nn.ModuleDict(dict(
+            wte = nn.Embedding(config.vocab_size, config.n_embd),  # token embeddings
+            wpe = nn.Embedding(config.block_size, config.n_embd),  # position embeddings
+            h = nn.ModuleList([Block(config) for _ in range(config.n_layer)]),  # stacked blocks
+            ln_f = nn.LayerNorm(config.n_embd)  # final normalization
+        ))
+        self.lm_head = nn.Linear(config.n_embd, config.vocab_size)  # language modeling head
 
-        self.token_embd_table = nn.Embedding(self.config.vocab_size, self.config.n_embd)
-        self.pos_embd_table = nn.Embedding(self.config.block_size, self.config.n_embd)
+        # weight sharing scheme
+        self.transformer.wte.weight = self.lm_head.weight
+        # follow gpt2 paper initialization
+        self.apply(self._init_weights)
+    
+    def _init_weights(self, module) -> None:
+        if isinstance(module, nn.Linear):
+            std = 0.02
+            if hasattr(module, "NANOGPT_SCALE_INIT"):
+                std *= (2 * self.config.n_layer) ** -0.5  # every block has both attention and mlp added
+            torch.nn.init.normal_(module.weight, mean=0.0, std=std)
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias)
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-        # stack multiple talk-think blocks sequantially
-        self.layers = nn.Sequential(*[Block(self.config) for _ in range(self.config.n_layer)])
+    def forward(self, idx: torch.Tensor, targets: torch.Tensor = None) -> list[torch.Tensor, torch.Tensor]:
+        B, T = idx.shape
+        assert T <= self.config.block_size, f"Cannot forward sequence of length {T}, block size is {self.config.block_size}."
 
-        # final layer normalization and language modeling head
-        self.ln_f = nn.LayerNorm(self.config.n_embd, self.config.n_embd)
-        self.lm_head = nn.Linear(self.config.n_embd, self.config.vocab_size)
-
-    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
-        # B, T = inputs.shape
-
-        # embed tokens and their positions as x
-        token_embds = self.token_embd_table(inputs)  # (B, T, n_embd)
-        pos_embds = self.pos_embd_table(torch.arange(self.config.block_size))  # (T, n_embd)
+        # embed tokens and their positions together as x
+        token_embds = self.transformer.wte(idx)  # (B, T, n_embd)
+        pos = torch.arange(0, T, dtype=torch.long, device=idx.device)  # (T)
+        pos_embds = self.transformer.wpe(pos)  # (T, n_embd)
         x = token_embds + pos_embds  # (B, T, n_embd) 
 
         # pass x through blocks and apply final normalization
-        x = self.layers(x)  # (B, T, n_embd)
-        x = self.ln_f(x)  # (B, T, n_embd)
+        for block in self.transformer.h:
+            x = block(x)  # (B, T, n_embd)
         
         # turn embeddings to logits of vocabulary size
+        x = self.transformer.ln_f(x)
         logits = self.lm_head(x)  # (B, T, vocab_size)
-        probs = F.softmax(logits, dim=2)  # (B, T, vocab_size)
-        return probs
+
+        loss = None
+        if targets is not None:
+            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1))  # cross_entropy() takes flat tansors
+        return logits, loss
 
     def generate(self, inputs: torch.Tensor, num_chars: int) -> None:
         # B, T = inputs.shape
@@ -186,21 +202,24 @@ class GPT(nn.Module):
         return inputs
 
 
-test_cfg = GPTConfig(
-    block_size = 6,
-    vocab_size = 50257,
-    n_layer = 3,
-    n_head = 4,
-    n_embd = 20,
-    n_examples = 2  
-)
-data = DataLoader(test_cfg)
-Xb, Yb = data.next_batch()
+model = GPT(GPTConfig())
+train_loader = DataLoaderLite(B=4, T=32)
 
-test_model = GPT(test_cfg)
-test_model(Xb)
-
-
-# Generate
-res = test_model.generate(Xb, 10)
-data.decode(res)
+optimizer = torch.optim.AdamW(params=model.parameters(), lr=3e-4)
+for i in range(50):
+    t0 = time.time()
+    # clean gradients
+    optimizer.zero_grad(set_to_none=True)
+    # load new batch
+    Xb, Yb = train_loader.next_batch()
+    # forward pass
+    logits, loss = model(Xb, Yb)
+    # backward pass
+    loss.backward()
+    # update parameters
+    optimizer.step()
+    t1 = time.time()
+    dt = (t1 - t0) * 1000 # time diff in miliseconds
+    tokens_per_sec = (train_loader.B * train_loader.T) / (t1 - t0)
+    log = f"step: {i} | loss: {loss.item()} | time: {dt:.2f}ms | tok/sec: {tokens_per_sec:.2f}"
+    print(log)
